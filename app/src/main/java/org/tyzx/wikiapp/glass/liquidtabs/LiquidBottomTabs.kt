@@ -1,0 +1,427 @@
+// 移植自 Kyant0/AndroidLiquidGlass 2.0.0 catalog（Apache-2.0）：
+// app/src/commonMain/kotlin/com/kyant/backdrop/catalog/components/LiquidBottomTabs.kt
+// app/src/commonMain/kotlin/com/kyant/backdrop/catalog/components/LiquidBottomTab.kt
+// 改动：Capsule 形状换成 CircleShape；强调色与底色改为参数由主题注入；
+// 选中层染色改用 saveLayer + ColorFilter 实现（等价于原 graphicsLayer colorFilter）；
+// 选中状态由主壳单向驱动，整块底板统一处理按压、拖动与松手确认；
+// 新增竖向上拽时整体收紧上移的果冻跟随（见 LiquidPullAnimation）。
+package org.tyzx.wikiapp.glass.liquidtabs
+
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.EaseOut
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshots.Snapshot
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.toRect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.Paint
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.util.fastCoerceIn
+import androidx.compose.ui.util.fastRoundToInt
+import androidx.compose.ui.util.lerp
+import com.kyant.backdrop.Backdrop
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import com.kyant.backdrop.drawBackdrop
+import com.kyant.backdrop.effects.blur
+import com.kyant.backdrop.effects.colorControls
+import com.kyant.backdrop.effects.lens
+import com.kyant.backdrop.highlight.Highlight
+import com.kyant.backdrop.shadow.InnerShadow
+import com.kyant.backdrop.shadow.Shadow
+import kotlin.math.abs
+import kotlin.math.sign
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+
+internal val LocalLiquidBottomTabScale = staticCompositionLocalOf { { 1f } }
+
+/** 底栏玻璃可调参数（由设置持久化，可在下载页调试面板实时调节）。 */
+data class LiquidGlassStyle(
+    val blurRadiusDp: Float,
+    val refractionHeightDp: Float,
+    val refractionAmountFrac: Float,
+    val chromaticAberration: Boolean,
+)
+
+@Composable
+internal fun LiquidBottomTabs(
+    selectedTabIndex: () -> Int,
+    onTabSelected: (index: Int) -> Unit,
+    backdrop: Backdrop,
+    tabsCount: Int,
+    accentColor: Color,
+    containerColor: Color,
+    glassStyle: LiquidGlassStyle,
+    modifier: Modifier = Modifier,
+    content: @Composable RowScope.() -> Unit,
+) {
+    val isLightTheme = MaterialTheme.colorScheme.surface.luminance() > 0.5f
+
+    // 与下载页玻璃浮窗同一配方（亮度/饱和度调节 + 深度折射 + 色散 + 边缘高光），保证全局玻璃质感一致
+    val luminance = if (isLightTheme) 0.58f else 0.42f
+    val l = (luminance * 2f - 1f).let { sign(it) * it * it }
+    val glassBrightness = if (l > 0f) lerp(0.1f, 0.5f, l) else lerp(0.1f, -0.2f, -l)
+    val glassContrast = if (l > 0f) lerp(1f, 0f, l) else 1f
+
+    val tabsBackdrop = rememberLayerBackdrop()
+
+    BoxWithConstraints(
+        modifier,
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        val density = LocalDensity.current
+        val tabWidth = with(density) {
+            (constraints.maxWidth.toFloat() - 8f.dp.toPx()) / tabsCount
+        }
+
+        val offsetAnimation = remember { Animatable(0f) }
+        val panelOffset by remember(density, constraints.maxWidth) {
+            derivedStateOf {
+                val fraction = (offsetAnimation.value / constraints.maxWidth).fastCoerceIn(-1f, 1f)
+                with(density) {
+                    4f.dp.toPx() * fraction.sign * EaseOut.transform(abs(fraction))
+                }
+            }
+        }
+
+        val isLtr = LocalLayoutDirection.current == LayoutDirection.Ltr
+        val animationScope = rememberCoroutineScope()
+        // 外层重组可能每次传入新的 lambda 实例，这里用 rememberUpdatedState 保持最新引用；
+        // 状态与协程不能以 lambda 身份作 remember key，否则会订阅到已废弃的状态对象。
+        val currentSelectedTabIndex by rememberUpdatedState(selectedTabIndex)
+        val currentOnTabSelected by rememberUpdatedState(onTabSelected)
+        val dampedDragAnimation = remember(animationScope, tabsCount) {
+            DampedDragAnimation(
+                animationScope = animationScope,
+                // 初始化只读取一次当前页，不让整块玻璃绘制层订阅 Tab 状态；后续同步由
+                // 下方 snapshotFlow 负责，切页不重组整块玻璃绘制层。
+                initialValue = Snapshot.withoutReadObservation {
+                    currentSelectedTabIndex().toFloat()
+                },
+                valueRange = 0f..(tabsCount - 1).toFloat(),
+                visibilityThreshold = 0.001f,
+                initialScale = 1f,
+                pressedScale = 78f / 56f,
+            )
+        }
+        // 选中页只有一个事实来源：主壳状态。底栏只订阅并驱动气泡，不再把动画索引
+        // 回写成第二条状态流，避免快速点击时新旧索引互相覆盖、页面延后一拍才切换。
+        LaunchedEffect(dampedDragAnimation) {
+            snapshotFlow { currentSelectedTabIndex() }
+                .collectLatest { index ->
+                    dampedDragAnimation.animateToValue(
+                        index.fastCoerceIn(0, tabsCount - 1).toFloat(),
+                    )
+                }
+        }
+
+        val pullAnimation = remember(animationScope, density) {
+            LiquidPullAnimation(
+                animationScope = animationScope,
+                halfPullTravel = with(density) { LiquidPullHalfTravel.toPx() },
+            )
+        }
+
+        val interactiveHighlight = remember(dampedDragAnimation, tabWidth, isLtr) {
+            InteractiveHighlight(
+                animationScope = animationScope,
+                position = { size ->
+                    Offset(
+                        if (isLtr) (dampedDragAnimation.value + 0.5f) * tabWidth + panelOffset
+                        else size.width - (dampedDragAnimation.value + 0.5f) * tabWidth + panelOffset,
+                        size.height / 2f,
+                    )
+                },
+            )
+        }
+
+        // 玻璃底板 + 未选中态的 Tab 内容
+        Row(
+            Modifier
+                .graphicsLayer {
+                    translationX = panelOffset
+                }
+                .drawBackdrop(
+                    backdrop = backdrop,
+                    shape = { CircleShape },
+                    effects = {
+                        colorControls(
+                            brightness = glassBrightness,
+                            contrast = glassContrast,
+                            saturation = 1.5f,
+                        )
+                        blur(glassStyle.blurRadiusDp.dp.toPx())
+                        lens(
+                            glassStyle.refractionHeightDp.dp.toPx(),
+                            size.minDimension * glassStyle.refractionAmountFrac.fastCoerceIn(0f, 1f),
+                            depthEffect = true,
+                            chromaticAberration = glassStyle.chromaticAberration,
+                        )
+                    },
+                    highlight = { Highlight.Plain },
+                    layerBlock = {
+                        val progress = dampedDragAnimation.pressProgress
+                        val scale = lerp(1f, 1f + 16f.dp.toPx() / size.width, progress)
+                        scaleX = scale
+                        scaleY = scale
+                        applyLiquidPull(pullAnimation)
+                    },
+                    onDrawSurface = { drawRect(containerColor) },
+                )
+                .then(interactiveHighlight.modifier)
+                .height(64f.dp)
+                .fillMaxWidth()
+                .padding(4f.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            content = content,
+        )
+
+        // 强调色版本的 Tab 内容：本体透明，只录制进 tabsBackdrop，透过选中气泡透出
+        CompositionLocalProvider(
+            LocalLiquidBottomTabScale provides {
+                lerp(1f, 1.2f, dampedDragAnimation.pressProgress)
+            },
+        ) {
+            Row(
+                Modifier
+                    .clearAndSetSemantics {}
+                    .alpha(0f)
+                    .layerBackdrop(tabsBackdrop)
+                    .graphicsLayer {
+                        translationX = panelOffset
+                    }
+                    .drawBackdrop(
+                        backdrop = backdrop,
+                        shape = { CircleShape },
+                        effects = {
+                            val progress = dampedDragAnimation.pressProgress
+                            colorControls(
+                                brightness = glassBrightness,
+                                contrast = glassContrast,
+                                saturation = 1.5f,
+                            )
+                            blur(glassStyle.blurRadiusDp.dp.toPx())
+                            lens(
+                                glassStyle.refractionHeightDp.dp.toPx() * progress,
+                                size.minDimension *
+                                    glassStyle.refractionAmountFrac.fastCoerceIn(0f, 1f) * progress,
+                                depthEffect = true,
+                                chromaticAberration = glassStyle.chromaticAberration,
+                            )
+                        },
+                        highlight = {
+                            val progress = dampedDragAnimation.pressProgress
+                            Highlight.Default.copy(alpha = progress)
+                        },
+                        layerBlock = { applyLiquidPull(pullAnimation) },
+                        onDrawSurface = { drawRect(containerColor) },
+                    )
+                    .then(interactiveHighlight.modifier)
+                    .height(56f.dp)
+                    .fillMaxWidth()
+                    .padding(horizontal = 4f.dp)
+                    .colorFilterLayer(ColorFilter.tint(accentColor)),
+                verticalAlignment = Alignment.CenterVertically,
+                content = content,
+            )
+        }
+
+        // 可拖动的选中气泡
+        Box(
+            Modifier
+                .padding(horizontal = 4f.dp)
+                .graphicsLayer {
+                    translationX =
+                        if (isLtr) dampedDragAnimation.value * tabWidth + panelOffset
+                        else size.width - (dampedDragAnimation.value + 1f) * tabWidth + panelOffset
+                }
+                .drawBackdrop(
+                    backdrop = rememberCombinedBackdrop(backdrop, tabsBackdrop),
+                    shape = { CircleShape },
+                    effects = {
+                        val progress = dampedDragAnimation.pressProgress
+                        lens(
+                            10f.dp.toPx() * progress,
+                            14f.dp.toPx() * progress,
+                            chromaticAberration = true,
+                        )
+                    },
+                    highlight = {
+                        val progress = dampedDragAnimation.pressProgress
+                        Highlight.Default.copy(alpha = progress)
+                    },
+                    shadow = {
+                        val progress = dampedDragAnimation.pressProgress
+                        Shadow(alpha = progress)
+                    },
+                    innerShadow = {
+                        val progress = dampedDragAnimation.pressProgress
+                        InnerShadow(
+                            radius = 8f.dp * progress,
+                            alpha = progress,
+                        )
+                    },
+                    layerBlock = {
+                        scaleX = dampedDragAnimation.scaleX
+                        scaleY = dampedDragAnimation.scaleY
+                        val velocity = dampedDragAnimation.velocity / 10f
+                        scaleX /= 1f - (velocity * 0.75f).fastCoerceIn(-0.2f, 0.2f)
+                        scaleY *= 1f - (velocity * 0.25f).fastCoerceIn(-0.2f, 0.2f)
+                        applyLiquidPull(
+                            pullAnimation,
+                            centerOffsetX = (dampedDragAnimation.value + 0.5f - tabsCount / 2f) *
+                                tabWidth * if (isLtr) 1f else -1f,
+                        )
+                    },
+                    onDrawSurface = {
+                        val progress = dampedDragAnimation.pressProgress
+                        drawRect(
+                            if (isLightTheme) Color.Black.copy(0.1f)
+                            else Color.White.copy(0.1f),
+                            alpha = 1f - progress,
+                        )
+                        drawRect(Color.Black.copy(alpha = 0.03f * progress))
+                    },
+                )
+                .height(56f.dp)
+                .fillMaxWidth(1f / tabsCount),
+        )
+
+        // 命中层固定在底板坐标系，不能跟着气泡或上拽形变平移/缩放，否则动画本身也会变成手指位移。
+        // 下层 clickable 继续提供键盘与无障碍操作，普通触摸全部由这里仲裁。
+        Box(
+            Modifier
+                .height(64.dp)
+                .fillMaxWidth()
+                .pointerInput(dampedDragAnimation, interactiveHighlight, pullAnimation, tabWidth, isLtr) {
+                    var pressedTabIndex = 0
+                    fun finishGesture(targetIndex: Int) {
+                        dampedDragAnimation.finishGesture(targetIndex.toFloat())
+                        interactiveHighlight.release()
+                        pullAnimation.release()
+                        animationScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                            offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
+                        }
+                    }
+                    detectLiquidTabGestures(
+                        onPress = { position ->
+                            pressedTabIndex = liquidTabIndexAt(
+                                x = position.x,
+                                tabWidth = tabWidth,
+                                horizontalPadding = 4.dp.toPx(),
+                                tabsCount = tabsCount,
+                                isLtr = isLtr,
+                            )
+                            animationScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                                offsetAnimation.stop()
+                            }
+                            dampedDragAnimation.pressAt(pressedTabIndex.toFloat())
+                            interactiveHighlight.press()
+                            pullAnimation.press()
+                        },
+                        onDrag = { deltaX ->
+                            dampedDragAnimation.dragBy(deltaX / tabWidth * if (isLtr) 1f else -1f)
+                            animationScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                                offsetAnimation.snapTo(offsetAnimation.value + deltaX)
+                            }
+                        },
+                        onPull = pullAnimation::pullTo,
+                        onRelease = { dragged ->
+                            val targetIndex = if (dragged) {
+                                dampedDragAnimation.targetValue.fastRoundToInt()
+                                    .fastCoerceIn(0, tabsCount - 1)
+                            } else {
+                                pressedTabIndex
+                            }
+                            finishGesture(targetIndex)
+                            currentOnTabSelected(targetIndex)
+                        },
+                        onCancel = { finishGesture(currentSelectedTabIndex()) },
+                    )
+                },
+        )
+    }
+}
+
+@Composable
+internal fun RowScope.LiquidBottomTab(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val scale = LocalLiquidBottomTabScale.current
+    Column(
+        modifier
+            .clip(CircleShape)
+            .clickable(
+                interactionSource = null,
+                indication = null,
+                role = Role.Tab,
+                onClick = onClick,
+            )
+            .fillMaxHeight()
+            .weight(1f)
+            .graphicsLayer {
+                val scale = scale()
+                scaleX = scale
+                scaleY = scale
+            },
+        verticalArrangement = Arrangement.spacedBy(2f.dp, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        content = content,
+    )
+}
+
+/** 用 saveLayer 给内容整体套一层 ColorFilter（把图标与文字染成强调色）。 */
+private fun Modifier.colorFilterLayer(colorFilter: ColorFilter): Modifier = drawWithCache {
+    val paint = Paint().apply { this.colorFilter = colorFilter }
+    onDrawWithContent {
+        drawIntoCanvas { canvas ->
+            canvas.saveLayer(size.toRect(), paint)
+            drawContent()
+            canvas.restore()
+        }
+    }
+}
