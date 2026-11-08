@@ -59,6 +59,8 @@ fun ExplorePage(
     onOpen: (String) -> Unit,
     onSearch: () -> Unit,
     backdrop: LayerBackdrop,
+    reloadSignal: Int = 0,
+    onMenu: () -> Unit = {},
 ) {
     val cs = MaterialTheme.colorScheme
     var feed by remember { mutableStateOf<List<Wiki.Feed>>(emptyList()) }
@@ -67,7 +69,7 @@ fun ExplorePage(
     var loading by remember { mutableStateOf(true) }
     var reload by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(reload) {
+    LaunchedEffect(reload, reloadSignal) {
         loading = true
         runCatching { Wiki.random(12) }.onSuccess { feed = it }
         runCatching { Wiki.recent(6) }.onSuccess { recent = it }
@@ -84,7 +86,7 @@ fun ExplorePage(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Box(
-                        Modifier.size(42.dp).clip(RoundedCornerShape(50)).clickable { },
+                        Modifier.size(42.dp).clip(RoundedCornerShape(50)).clickable { onMenu() },
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(Icons.Filled.Menu, null, tint = cs.onSurfaceVariant, modifier = Modifier.size(22.dp))

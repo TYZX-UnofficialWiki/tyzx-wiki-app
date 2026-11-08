@@ -4,6 +4,9 @@
 package org.tyzx.wikiapp.glass
 
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -38,6 +41,7 @@ fun TyBottomBar(
     backdrop: LayerBackdrop,
     glassStyle: LiquidGlassStyle,
     surfaceAlpha: Float = 0.25f,
+    containerColorOverride: Color? = null,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier.fillMaxSize()) {
@@ -48,8 +52,9 @@ fun TyBottomBar(
             backdrop = backdrop,
             tabsCount = tabs.size,
             accentColor = MaterialTheme.colorScheme.primary,
-            containerColor = (if (isLightTheme) Color.White else Color.Black)
-                .copy(alpha = surfaceAlpha.coerceIn(0f, 1f)),
+            containerColor = containerColorOverride
+                ?: (if (isLightTheme) Color.White else Color.Black)
+                    .copy(alpha = surfaceAlpha.coerceIn(0f, 1f)),
             glassStyle = glassStyle,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -62,19 +67,22 @@ fun TyBottomBar(
             val contentColor = MaterialTheme.colorScheme.onSurfaceVariant
             tabs.forEachIndexed { index, tab ->
                 LiquidBottomTab(onClick = { onTabSelected(index) }) {
-                    Icon(
-                        imageVector = tab.icon,
-                        contentDescription = null,
-                        tint = contentColor,
-                        modifier = Modifier.size(24.dp),
-                    )
-                    Text(
-                        text = tab.label,
-                        color = contentColor,
-                        style = MaterialTheme.typography.labelSmall,
-                        textAlign = TextAlign.Center,
-                        maxLines = 1,
-                    )
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(
+                            imageVector = tab.icon,
+                            contentDescription = null,
+                            tint = contentColor,
+                            modifier = Modifier.size(23.dp),
+                        )
+                        Spacer(Modifier.height(3.dp))
+                        Text(
+                            text = tab.label,
+                            color = contentColor,
+                            style = MaterialTheme.typography.labelSmall,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                        )
+                    }
                 }
             }
         }
